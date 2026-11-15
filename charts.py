@@ -138,6 +138,22 @@ def _box_by_group(ax, df, d):
             fontsize=8.5, color="#6b7280", va="top")
 
 
+def _num(v, nd=2):
+    """
+    图表里的数字格式：不要科学计数法。
+
+    2502139.72 被写成 2.50214e+06 时，标题读起来像一串乱码；
+    这些是给人看的图，宁可写成 2502140。
+    """
+    x = round(float(v), nd)
+    if x == 0:
+        return "0"
+    if abs(x) >= 10000:
+        return f"{x:.0f}"
+    text = f"{x:.{nd}f}"
+    return text.rstrip("0").rstrip(".") if "." in text else text
+
+
 def _line_trend(ax, df, d):
     axis_col, num = d["columns"]
     unit = d.get("axis") or "day"
@@ -172,7 +188,8 @@ def _line_trend(ax, df, d):
 
     ax.set_ylabel(num, color=TEXT, fontsize=10)
     if isinstance(per, (int, float)):
-        ax.set_title(L(f"「{num}」随{axis_col}的走势（每{period}约 {round(per, 2):+g}）",
+        ax.set_title(L(f"「{num}」随{axis_col}的走势（每{period}约 "
+                       f"{'+' if per > 0 else ''}{_num(per, 2)}）",
                        f"{num} over {axis_col}"),
                      fontsize=11, color=TEXT, pad=10)
     else:
@@ -198,7 +215,7 @@ def _box_single(ax, df, d):
     extreme = d["numbers"].get("最极端值")
     if isinstance(extreme, (int, float)):
         # 用抖动让标注点落在离群点旁边，而不是压在箱体上
-        ax.annotate(L(f"离群：{extreme:g}", f"outlier: {extreme:g}"),
+        ax.annotate(L(f"离群：{_num(extreme)}", f"outlier: {_num(extreme)}"),
                     xy=(1 + 0.06, extreme), xytext=(1.18, extreme),
                     fontsize=9, color=ACCENT, va="center",
                     arrowprops={"arrowstyle": "-", "color": ACCENT, "linewidth": 1})
