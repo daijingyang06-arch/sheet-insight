@@ -28,6 +28,7 @@ M3 · AI 表达层 —— 把统计结果翻译成能直接放进报告的中文
 import argparse
 import json
 import os
+import re
 import sys
 import urllib.error
 import urllib.request
@@ -103,12 +104,42 @@ def build_messages(discovery, retry_bad=None):
 # ============================================================
 # 2. 模板生成器（离线兜底）
 # ============================================================
+def _short(name, limit=14):
+    """
+    正文里用的列名简称。
+
+    真实统计表的列名往往很长，还带着单位说明——
+    「中国同北美洲其他国家(地区)进出口总额(万美元)」。
+    一句话里塞三个这样的名字，读者根本抓不住重点。
+    这里去掉括号里的说明，过长再截断；完整列名仍然保留在「依据」一行里可查。
+    """
+    s = re.sub(r"[（(][^）)]*[）)]", "", str(name)).strip()
+    return s if len(s) <= limit else s[:limit] + "…"
+
+
 def _fmt(v, nd=2):
-    """格式化数字。必须和 number_guard._variants 用同样的 round，否则会被自己的守卫拦下。"""
+    """
+    格式化数字。必须和 number_guard._variants 用同样的 round，否则会被自己的守卫拦下。
+
+    这里不能图省事用 `:g`——它会把 2502139.72 输出成 `2.50214e+06`，
+    而守卫提取数字时会把指数部分拆成 `2.50214` 和 `06` 两个"未授权数字"，
+    于是报告里的每一个大额数字都会被自己拦下来（真实数据一测就暴露了）。
+    现在只有极小值（p 值那类）才用科学计数法。
+    """
     if isinstance(v, str):
         return v
     if isinstance(v, (int, float)):
-        return f"{round(float(v), nd):g}"
+        x = round(float(v), nd)
+        if x == 0:
+            return "0"
+        if abs(x) < 1e-4:
+            return f"{x:.2e}"
+        text = f"{x:.{nd}f}"
+        # 只削小数部分末尾的 0。若不判断小数点就直接 rstrip("0")，
+        # 300 会被削成 3——"样本 300 条"变成"样本 3 条"，守卫当场拦下。
+        if "." in text:
+            text = text.rstrip("0").rstrip(".")
+        return text
     return str(v)
 
 
@@ -137,13 +168,22 @@ class TemplateNarrator:
 
         if kind == "correlation":
             a, b = d["columns"]
+            sa, sb = _short(a), _short(b)
             r = n["r"]
             direction = "正" if r > 0 else "负"
+            if d.get("note") == "near_same":
+                # r 接近 1 时照实说，并点明这是定义造成的必然，不是"发现"
+                return (
+                    f"「{sa}」与「{sb}」几乎完全重合（r = {_fmt(r, 3)}，样本 {_fmt(n['n'], 0)} 条）。"
+                    f"这通常说明两个指标是同一件事的不同口径——比如一个总量本身就包含另一个。"
+                    f"相关接近 1 是由定义决定的，不该当作新发现；"
+                    f"它们各自的变化幅度才是有信息量的部分。"
+                )
             # 注意：正文里只出现 r / n / 均值这几个已经在 numbers 里的数字
             return (
-                f"「{a}」与「{b}」之间存在{direction}相关（r = {_fmt(r, 3)}，样本 {_fmt(n['n'], 0)} 条）。"
+                f"「{sa}」与「{sb}」之间存在{direction}相关（r = {_fmt(r, 3)}，样本 {_fmt(n['n'], 0)} 条）。"
                 f"相关系数 {_fmt(abs(r), 2)} 属于{_strength(r)}程度，"
-                f"也就是说{a}较高的样本，{b}倾向于也{'较' + ('高' if r > 0 else '低')}。"
+                f"也就是说{sa}较高的样本，{sb}倾向于也{'较' + ('高' if r > 0 else '低')}。"
                 f"需要说明的是，这只是相关关系，不能说明其中一个直接决定了另一个。"
             )
 
@@ -153,10 +193,11 @@ class TemplateNarrator:
             hi, lo = n["最高组"], n["最低组"]
             eta2 = n["eta2"]
             pct = _fmt(eta2 * 100, 1)
+            scat, snum = _short(cat), _short(num)
             return (
-                f"不同「{cat}」的「{num}」存在明显差异：「{hi}」组最高"
+                f"不同「{scat}」的「{snum}」存在明显差异：「{hi}」组最高"
                 f"（平均 {_fmt(means[hi])}），「{lo}」组最低（{_fmt(means[lo])}）。"
-                f"效应量 η² = {_fmt(eta2, 4)}，意味着「{cat}」可以解释约 {pct}% 的{num}差异，"
+                f"效应量 η² = {_fmt(eta2, 4)}，意味着「{scat}」可以解释约 {pct}% 的{snum}差异，"
                 f"这个差异幅度在实际中是可以感受到的。"
             )
 
@@ -166,8 +207,9 @@ class TemplateNarrator:
             per = n["每周期变化"]
             total = n["全期变化"]
             up = per > 0
+            snum, saxis = _short(num), _short(axis_col)
             return (
-                f"「{num}」随{axis_col}呈{'上升' if up else '下降'}趋势："
+                f"「{snum}」随{saxis}呈{'上升' if up else '下降'}趋势："
                 f"平均每{period}{'增加' if up else '减少'} {_fmt(abs(per))}，"
                 f"{n['跨度']}里累计{'增加' if up else '减少'} {_fmt(abs(total))}。"
                 f"这个变化幅度超过了数据本身的波动，"
@@ -177,7 +219,7 @@ class TemplateNarrator:
         if kind == "outlier":
             num = d["columns"][0]
             return (
-                f"「{num}」中有 {n['离群个数']} 个明显偏离整体的值，最极端的是 {_fmt(n['最极端值'])}，"
+                f"「{_short(num)}」中有 {n['离群个数']} 个明显偏离整体的值，最极端的是 {_fmt(n['最极端值'])}，"
                 f"而中位数只有 {_fmt(n['中位数'])}，偏离了 {_fmt(n['偏离倍数'])} 倍稳健标准差。"
                 f"这类值通常是录入错误或极端个案，建议回到原始问卷核对这一条记录，"
                 f"确认后再决定是否保留。"

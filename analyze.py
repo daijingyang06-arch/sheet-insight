@@ -20,6 +20,7 @@
 
 import json
 import os
+import re
 import sys
 
 import numpy as np
@@ -173,6 +174,73 @@ def _coerce_dtypes(df):
     return df
 
 
+_YEAR_COL_RE = re.compile(r"^(19|20)\d{2}\s*年?$")
+_LABEL_HINTS = ("指标", "名称", "项目", "地区", "类别", "省份", "品类", "产品")
+
+
+def _maybe_transpose_wide_years(df):
+    """
+    识别「年份在列」的宽表，转置成「年份在行」的标准时间序列表。
+
+    国家统计局、海关总署导出的数据几乎都是这个形状：
+
+        序号 | 指标                        | 2024年  | 2023年  | … | 2006年
+        1    | 中国同美国进出口总额        | 68833151 | 66400000 | … | 26265946
+        2    | 中国同加拿大进出口总额      | 9300957  | 8900000  | … | 2317883
+
+    如果照原样分析，"2024年"会被当成一个普通数值列，它的均值是把
+    美国进出口额和"北美洲其他国家"的进出口额加在一起算出来的——
+    数字算得出来，但没有任何含义，属于最典型的"沉默地算错"。
+
+    转置之后：列 = 各项指标，行 = 年份。年份变成时间轴，
+    每个指标都能各算各的趋势，相关系数也只在同一时间截面上比。
+    """
+    if df.empty or len(df) < 3:
+        return df
+
+    year_cols = [c for c in df.columns if _YEAR_COL_RE.match(str(c).strip())]
+    if len(year_cols) < 3:
+        return df
+
+    # 找标签列：值应该是"文字"，优先挑名字像标签的
+    others = [c for c in df.columns if c not in year_cols]
+    label_col = None
+    for c in others:
+        if any(h in str(c) for h in _LABEL_HINTS):
+            label_col = c
+            break
+    if label_col is None:
+        for c in others:
+            vals = df[c].dropna().astype(str)
+            if len(vals) >= 3 and vals.str.len().mean() >= 4:
+                label_col = c
+                break
+    if label_col is None:
+        return df
+
+    # 年份列按真实年份升序排列（原表通常是倒序的）
+    ordered = sorted(year_cols, key=lambda c: int(re.match(r"^(19|20)\d{2}", str(c).strip()).group(0)))
+
+    sub = df[[label_col] + ordered].dropna(subset=[label_col])
+    # 表尾的"数据来源：xxx""注：xxx"不是指标，先剔掉
+    keep = ~sub[label_col].astype(str).str.contains("数据来源|注：|说明|单位：", na=False)
+    sub = sub[keep]
+    if len(sub) < 2:
+        return df
+
+    wide = sub.set_index(label_col)[ordered].T
+    wide.index = [int(re.match(r"^(19|20)\d{2}", str(c).strip()).group(0)) for c in wide.index]
+    wide.index.name = "年份"
+
+    out = wide.reset_index()
+    # 指标名里常见的"0中国同美国…""1中国向美国出口…"前缀是分类序号，去掉更好读
+    out.columns = [re.sub(r"^\d+", "", str(c)).strip() if str(c) != "年份" else "年份"
+                   for c in out.columns]
+    out = out.loc[:, ~out.columns.duplicated()]
+    out = _coerce_dtypes(out)
+    return out
+
+
 def load_table(path):
     """读取 CSV / Excel，并做最基础的清理（列名去空格）。"""
     ext = os.path.splitext(path)[1].lower()
@@ -205,6 +273,8 @@ def load_table(path):
     df.columns = [str(c).replace("\u3000", " ").strip() for c in df.columns]
     # 去掉完全空白的列（合并单元格撑出来的空列就靠这一步清掉）
     df = df.dropna(axis=1, how="all")
+    # 年份在列的宽表先转置，否则会把"2024年"当成一个普通指标来算均值
+    df = _maybe_transpose_wide_years(df)
     return df
 
 
@@ -314,7 +384,7 @@ def build_profile(df, roles):
 # ============================================================
 # 4. 各类发现
 # ============================================================
-def _make(kind, score, headline, numbers, columns, suggestion, axis=None):
+def _make(kind, score, headline, numbers, columns, suggestion, axis=None, note=None):
     """统一的发现数据结构。numbers 就是后面给 LLM 的"数字白名单"。"""
     return {
         "kind": kind,
@@ -324,6 +394,7 @@ def _make(kind, score, headline, numbers, columns, suggestion, axis=None):
         "columns": columns,
         "suggestion": suggestion,   # 建议画什么图
         "axis": axis,               # 仅趋势类用：day / year / month
+        "note": note,               # 特殊标记，如 near_same（两个指标近乎重合）
     }
 
 
@@ -356,15 +427,28 @@ def find_correlations(df, roles):
             score = abs(r) * (0.7 + 0.3 * sig)
             direction = "正" if r > 0 else "负"
 
+            # |r| ≈ 1 往往不是"发现"，而是两个指标本来就是同一个东西：
+            # 总量与它的分项、同一指标的不同口径（如"北美洲进出口"包含"美国进出口"）。
+            # 这种关系照实写出来，但不该占报告头条——它会挤掉真正值得说的问题。
+            # 处理方式：降权 + 换一种说法，让读者知道这是定义造成的必然。
+            near_same = abs(r) >= 0.995
+            if near_same:
+                score *= 0.55
+                headline = (f"「{a}」与「{b}」几乎完全重合（r={r:.3f}），"
+                            f"很可能是同一指标的不同口径")
+            else:
+                headline = f"「{a}」与「{b}」呈{corr_strength(r)}{direction}相关（r={r:.2f}）"
+
             out.append(_make(
                 kind="correlation",
                 score=score,
-                headline=f"「{a}」与「{b}」呈{corr_strength(r)}{direction}相关（r={r:.2f}）",
+                headline=headline,
                 numbers={"r": round(float(r), 3), "p": float(f"{p:.2e}"), "n": n,
                          "均值_a": round(float(pair[a].mean()), 2),
                          "均值_b": round(float(pair[b].mean()), 2)},
                 columns=[a, b],
                 suggestion="scatter" if abs(r) > 0.4 else "hexbin",
+                note="near_same" if near_same else None,
             ))
     return out
 
