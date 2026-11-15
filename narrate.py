@@ -113,12 +113,8 @@ def _fmt(v, nd=2):
 
 
 def _strength(r):
-    a = abs(r)
-    if a >= 0.6:
-        return "较强"
-    if a >= 0.4:
-        return "中等"
-    return "较弱"
+    # 与 analyze.corr_strength 共用同一套分级，避免标题说"高度"、正文说"较强"互相打脸
+    return {"高度": "很强", "中度": "中等", "低度": "较弱"}[A.corr_strength(r)]
 
 
 class TemplateNarrator:
@@ -369,11 +365,20 @@ def _profile_table(profile, roles):
     return "\n".join(lines)
 
 
+def _cn_num(n):
+    """1 → 一，用于章节序号（报告里最多到五，不需要通用实现）。"""
+    return "一二三四五六七八九十"[n - 1]
+
+
 def render_report(source, profile, roles, records, discoveries, issues, backends):
     ts = datetime.now().strftime("%Y-%m-%d %H:%M")
     n_llm = sum(1 for b in backends if b == "llm")
-    mode = (f"大模型生成 {n_llm} 条，其余为模板兜底" if n_llm
-            else "全部由模板生成（未联网）")
+    if not records:
+        mode = "未生成结论"
+    elif n_llm:
+        mode = f"大模型生成 {n_llm} 条，其余为模板兜底"
+    else:
+        mode = "全部由模板生成（未联网）"
 
     L = []
     L.append(f"# 数据分析报告：{source}\n")
@@ -387,6 +392,17 @@ def render_report(source, profile, roles, records, discoveries, issues, backends
     L.append(_profile_table(profile, roles) + "\n")
 
     L.append("## 二、主要发现\n")
+    if not discoveries:
+        # 没有发现也要出报告。之前这里是直接 return，用户只看到终端里一句话、拿不到文件，
+        # 等于白跑一次。踏踏实实说"为什么没有"，比什么都不给要有用。
+        L.append(f"本次**没有发现达到统计门槛的关系**"
+                 f"（要求 |r| ≥ {A.MIN_R:.2f} 且 p < {A.P_THRESHOLD}，或分组差异显著）。\n")
+        L.append("常见原因有三种：\n")
+        L.append("1. **字段之间确实缺少稳定关联**——这份数据本身就是描述性的，不需要硬造结论；")
+        L.append("2. **样本量偏少**——几十行以下时，真实的规律也常常达不到显著性；")
+        L.append(f"3. **数据变异太小**——比如某一列几乎全是同一个值，算不出关系。\n")
+        L.append("如果你确信数据里有规律，可以把表格补全后重新分析，"
+                 "或直接指定想看的两个字段来单独检验。\n")
     for i, (rec, d) in enumerate(zip(records, discoveries), 1):
         L.append(f"### {i}. 【{KIND_CN.get(d['kind'], d['kind'])}】{d['headline']}\n")
         if rec.get("chart"):
@@ -396,20 +412,33 @@ def render_report(source, profile, roles, records, discoveries, issues, backends
         L.append(f"**依据**：基于 {', '.join(d['columns'])}；"
                  f"统计量见上，可自行核对。\n")
 
+    # 章节序号必须跟着实际出现的章节走。
+    # 之前是写死的"三、数据质量提示""四、局限说明"，一旦这张表没有数据质量问题，
+    # 读者看到的就是"二、主要发现 → 四、局限说明"，中间凭空缺了一节，像是生成坏了。
+    sec = 2
+
     if issues:
-        L.append("## 三、数据质量提示\n")
+        sec += 1
+        L.append(f"## {_cn_num(sec)}、数据质量提示\n")
         L.append("| 字段 | 问题 | 严重度 |")
         L.append("|---|---|---|")
         for it in issues:
             L.append(f"| {it['列']} | {it['问题']} | {it['严重度']} |")
         L.append("")
 
-    L.append("## 四、局限说明\n")
+    sec += 1
+    L.append(f"## {_cn_num(sec)}、局限说明\n")
     L.append("- 本报告只做**描述性分析**，说明数据中呈现的关系，"
              "**不能证明因果关系**。")
     L.append("- 结论的可靠性依赖样本质量；缺失率高或类别极不均衡的字段已在上表中标出。")
-    L.append(f"- 样本量 {profile['rows']} 行，"
-             "在小样本下，个别极端值可能对统计量产生较大影响。\n")
+    n_rows = profile["rows"]
+    if n_rows < A.SMALL_SAMPLE_N:
+        # 小样本要主动说破，而不是塞进一句放之四海皆准的"个别极端值可能有影响"
+        L.append(f"- **样本量仅 {n_rows} 行，属于小样本。** 相关系数与显著性都容易受"
+                 f"个别极端值影响，结论应视为探索性参考，不宜据此下强判断；"
+                 f"需要更可靠的结论时建议补充样本（{A.SMALL_SAMPLE_N} 行以上）。\n")
+    else:
+        L.append(f"- 样本量 {n_rows} 行；行数不多时，个别极端值可能对统计量产生较大影响。\n")
     L.append("---\n")
     L.append("*由「表格分析助手」生成：统计层负责计算，表达层负责措辞，"
              "两件事严格分开。*")
@@ -460,8 +489,7 @@ def main(argv=None):
     discoveries = A.select_top(all_found, top_k=6)
 
     if not discoveries:
-        print("没有找到值得报告的发现。可能是数据量太小，或字段之间确实缺少关联。")
-        return 1
+        print("没有找到达到统计门槛的发现——仍会生成一份报告，说清楚为什么。")
 
     # --- 表达层：逐条生成 ---
     narrator = pick_narrator(args.backend)

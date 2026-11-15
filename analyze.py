@@ -31,11 +31,42 @@ DEFAULT_PATH = os.path.join(BASE_DIR, "data", "sample_survey.csv")
 OUT_JSON = os.path.join(BASE_DIR, "results", "discoveries.json")
 
 # 参与统计的门槛（阈值太低会产出大量"噪音发现"，太高又会漏掉真实规律）
-MIN_PAIR_N = 50          # 算相关性至少需要多少行
+#
+# 【MIN_PAIR_N 为什么从 50 改成 12】
+# 50 是在 300 行的问卷数据上调出来的。拿它去跑一份 31 行的地区经济数据
+# （31 个省 × GDP × 社会消费品零售总额），结果是：相关性一条都进不来。
+# 可那张表里 r = 0.97、p = 5.6e-20，是全表唯一的、也是最重要的结论。
+# 引擎什么都没说，用户只会以为"这份数据没规律"——这正是最危险的失败：
+# 不报错，只是安静地把真结论丢掉。
+#
+# 根子上的错在于把两件事混成了一件：p 值门槛本来就随样本量自动调整
+# （n 变小时，同样的 r 更难显著），再压一个 n ≥ 50 是重复限制，
+# 等于把整类中等规模的表格（几十行，真实场景里极常见）一刀切拒之门外。
+#
+# 现在 12 只用来挡"3 个点连成直线"这种极端情况，真正的把关交给 p 值和 |r|。
+MIN_PAIR_N = 12          # 算相关/检验的硬下限
+SMALL_SAMPLE_N = 30      # 低于此行数，报告要主动标注"样本偏少"
 MIN_GROUP_N = 8          # 每个分组至少多少人
 MIN_R = 0.25             # 相关系数绝对值下限
 P_THRESHOLD = 0.01       # 显著性水平
 MAX_MISSING_FOR_TEST = 0.40   # 缺失率超过这个值的列不参与组间检验
+
+
+def corr_strength(r):
+    """
+    相关系数的强度分级，按统计教材的通用口径：
+    |r| ≥ 0.8 高度、≥ 0.5 中度、其余低度。
+
+    这个函数存在的唯一理由是"只留一个真相来源"：
+    标题里写"高度正相关"、正文里写"属于较强程度"，两句话必须对得上。
+    之前标题是写死的"中等以上"，于是 r=0.97 和 r=0.51 得到一模一样的措辞。
+    """
+    a = abs(r)
+    if a >= 0.8:
+        return "高度"
+    if a >= 0.5:
+        return "中度"
+    return "低度"
 
 
 # ============================================================
@@ -45,7 +76,16 @@ def load_table(path):
     """读取 CSV / Excel，并做最基础的清理（列名去空格）。"""
     ext = os.path.splitext(path)[1].lower()
     if ext in (".xlsx", ".xls"):
-        df = pd.read_excel(path)
+        try:
+            df = pd.read_excel(path)
+        except ImportError:
+            # 原始报错是 "Missing optional dependency 'openpyxl'"，用户看不懂该干什么。
+            # 这里把它翻译成一条可以直接照抄的命令——出错信息的第一职责是给出下一步。
+            raise SystemExit(
+                f"\n读取 {ext} 需要一个额外的引擎库，装上即可：\n"
+                f"    python -m pip install openpyxl\n"
+                f"（若是老的 .xls 格式，再补一个：python -m pip install xlrd）\n"
+            ) from None
     else:
         # utf-8-sig 能吃掉 Excel 导出时带的 BOM，不加的话第一列列名会变成 "\ufeff学号"
         df = pd.read_csv(path, encoding="utf-8-sig")
@@ -193,7 +233,7 @@ def find_correlations(df, roles):
             out.append(_make(
                 kind="correlation",
                 score=score,
-                headline=f"「{a}」与「{b}」呈中等以上{direction}相关（r={r:.2f}）",
+                headline=f"「{a}」与「{b}」呈{corr_strength(r)}{direction}相关（r={r:.2f}）",
                 numbers={"r": round(float(r), 3), "p": float(f"{p:.2e}"), "n": n,
                          "均值_a": round(float(pair[a].mean()), 2),
                          "均值_b": round(float(pair[b].mean()), 2)},
