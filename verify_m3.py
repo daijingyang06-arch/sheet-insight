@@ -287,15 +287,17 @@ def test_fidelity(df, discoveries):
                          f"组均值 {len(groups)} 组逐一对齐")
 
         elif kind == "trend":
-            date_col, num = d["columns"]
-            t = pd.to_datetime(df[date_col], errors="coerce", format="mixed")
+            axis_col, num = d["columns"]
+            unit = d.get("axis") or "day"
+            x_raw, _ = A.build_time_axis(df, axis_col, unit)
             v = pd.to_numeric(df[num], errors="coerce")
-            sub = pd.DataFrame({"t": t, "v": v}).dropna()
-            x = (sub["t"] - sub["t"].min()).dt.days.to_numpy().astype(float)
-            res = stats.linregress(x, sub["v"].to_numpy())
-            weekly = res.slope * 7
-            ok = abs(weekly - nums["每周变化"]) < 0.01
-            notes.append(f"每周变化 重算 {weekly:.4f} vs 记录 {nums['每周变化']}")
+            sub = pd.DataFrame({"x": x_raw, "v": v}).dropna()
+            res = stats.linregress(sub["x"].to_numpy().astype(float),
+                                   sub["v"].to_numpy().astype(float))
+            factor = {"day": 7.0, "year": 1.0, "month": 1.0}[unit]
+            per = res.slope * factor
+            ok = abs(per - nums["每周期变化"]) < 0.01
+            notes.append(f"每{nums['周期']}变化 重算 {per:.4f} vs 记录 {nums['每周期变化']}")
 
         elif kind == "outlier":
             col = d["columns"][0]

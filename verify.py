@@ -59,7 +59,7 @@ def _has_group(ds, cat, num):
 def _has_trend(ds, num, sign):
     for d in ds:
         if d["kind"] == "trend" and d["columns"][1] == num:
-            if (d["numbers"]["每周变化"] > 0) == (sign > 0):
+            if (d["numbers"]["每周期变化"] > 0) == (sign > 0):
                 return True
     return False
 

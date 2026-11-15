@@ -23,6 +23,9 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from matplotlib import font_manager
+from matplotlib.ticker import MaxNLocator
+
+import analyze as A
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CHART_DIR = os.path.join(BASE_DIR, "results", "charts")
@@ -136,32 +139,46 @@ def _box_by_group(ax, df, d):
 
 
 def _line_trend(ax, df, d):
-    date_col, num = d["columns"]
-    t = pd.to_datetime(df[date_col], errors="coerce", format="mixed")
+    axis_col, num = d["columns"]
+    unit = d.get("axis") or "day"
+    x_raw, t_raw = A.build_time_axis(df, axis_col, unit)
     v = pd.to_numeric(df[num], errors="coerce")
-    sub = pd.DataFrame({"t": t, "v": v}).dropna().sort_values("t")
+    sub = pd.DataFrame({"x": x_raw, "t": t_raw, "v": v}).dropna().sort_values("x")
 
-    ax.scatter(sub["t"], sub["v"], s=14, alpha=0.35, color="#9ca3af",
-               edgecolors="none", label=L("每条记录", "records"))
+    period = d["numbers"].get("周期", "周")
+    per = d["numbers"].get("每周期变化")
 
-    # 按天取均值再连线，否则原始点太密、看不出趋势
-    daily = sub.set_index("t")["v"].resample("D").mean().dropna()
-    if len(daily) >= 2:
-        ax.plot(daily.index, daily.values, color=PRIMARY, linewidth=2.2,
-                marker="o", markersize=3.5, label=L("按天均值", "daily mean"))
+    if unit == "day":
+        ax.scatter(sub["t"], sub["v"], s=14, alpha=0.35, color="#9ca3af",
+                   edgecolors="none", label=L("每条记录", "records"))
+        # 按天取均值再连线，否则原始点太密、看不出趋势
+        daily = sub.set_index("t")["v"].resample("D").mean().dropna()
+        if len(daily) >= 2:
+            ax.plot(daily.index, daily.values, color=PRIMARY, linewidth=2.2,
+                    marker="o", markersize=3.5, label=L("按天均值", "daily mean"))
+        ax.tick_params(axis="x", rotation=30)
+    else:
+        # 年份 / 月份轴：直接按轴值画散点 + 拟合线，刻度就是年份或月份
+        ax.scatter(sub["x"], sub["v"], s=26, alpha=0.75, color=PRIMARY,
+                   edgecolors="none", label=L("实际值", "actual"))
+        if len(sub) >= 2:
+            k, b0 = np.polyfit(sub["x"], sub["v"], 1)
+            xs = np.linspace(sub["x"].min(), sub["x"].max(), 50)
+            ax.plot(xs, k * xs + b0, color=ACCENT, linewidth=2,
+                    label=L("线性趋势", "trend"))
+        ax.set_xlabel(axis_col, color=TEXT, fontsize=10)
+        # 年份/月份是离散整数，不加这一行 matplotlib 会画出 2007.5 这种刻度
+        ax.xaxis.set_major_locator(MaxNLocator(integer=True, nbins=8))
 
-    weekly = d["numbers"].get("每周变化")
-    ax.set_xlabel(date_col, color=TEXT, fontsize=10)
     ax.set_ylabel(num, color=TEXT, fontsize=10)
-    if isinstance(weekly, (int, float)):
-        ax.set_title(L(f"「{num}」随时间的走势（每周约 {round(weekly, 2):+g}）",
-                       f"{num} over time"),
+    if isinstance(per, (int, float)):
+        ax.set_title(L(f"「{num}」随{axis_col}的走势（每{period}约 {round(per, 2):+g}）",
+                       f"{num} over {axis_col}"),
                      fontsize=11, color=TEXT, pad=10)
     else:
-        ax.set_title(L(f"「{num}」随时间的走势", f"{num} over time"),
+        ax.set_title(L(f"「{num}」随{axis_col}的走势", f"{num} over {axis_col}"),
                      fontsize=11, color=TEXT, pad=10)
     ax.legend(frameon=False, fontsize=9, loc="best")
-    ax.tick_params(axis="x", rotation=30)
 
 
 def _box_single(ax, df, d):

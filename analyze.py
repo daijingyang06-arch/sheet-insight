@@ -52,6 +52,54 @@ P_THRESHOLD = 0.01       # 显著性水平
 MAX_MISSING_FOR_TEST = 0.40   # 缺失率超过这个值的列不参与组间检验
 
 
+def time_axis_unit(col, s):
+    """
+    判断一列数字是不是「时间轴」，返回 "year" / "month" / None。
+
+    为什么需要这个：`find_trends` 原先只认真正的日期列。
+    可现实里大量数据的时间轴就是普通数字——「年份 2005-2025」「月份 1-12」。
+    这类列被判成普通数值列之后，趋势分析压根不会看它，
+    于是一份 2005-2025 的生产数据，最重要的"逐年增长"结论直接消失。
+
+    名字必须**明确指向时间**才认（免得把"年龄"当成"年"）：
+    年份 / 年度 / year、月份 / month，并且数值范围要合理。
+    """
+    name = str(col).lower().strip()
+    v = pd.to_numeric(s, errors="coerce").dropna()
+    if len(v) < 3 or v.nunique() < 3:
+        return None
+    # 时间轴一定是整数（2005、1、12），带小数的大概率是普通指标
+    if not np.all(np.equal(np.mod(v.to_numpy(dtype=float), 1), 0)):
+        return None
+
+    lo, hi = float(v.min()), float(v.max())
+    is_year_name = name.endswith(("年份", "年度")) or name in ("年", "year", "years")
+    is_month_name = name.endswith(("月份",)) or name in ("月", "month", "months")
+
+    if is_year_name and 1900 <= lo and hi <= 2100:
+        return "year"
+    if is_month_name and 1 <= lo and hi <= 12:
+        return "month"
+    return None
+
+
+def build_time_axis(df, col, unit):
+    """
+    把时间轴列转成数值横坐标 + 可直接标注的原始值。
+
+    三种轴的单位不同，横坐标也就用不同的单位，这样"每周期变化"才对得上：
+      day   → 距首日的天数（每 7 天 = 一周）
+      year  → 年份本身（2005、2006…）
+      month → 月份本身（1、2…12）
+    """
+    if unit == "day":
+        t = pd.to_datetime(df[col], errors="coerce", format="mixed")
+        base = t.min()
+        return (t - base).dt.days.astype(float), t
+    v = pd.to_numeric(df[col], errors="coerce").astype(float)
+    return v, v
+
+
 def corr_strength(r):
     """
     相关系数的强度分级，按统计教材的通用口径：
@@ -72,12 +120,65 @@ def corr_strength(r):
 # ============================================================
 # 1. 读取
 # ============================================================
+def _detect_header_row(raw):
+    """
+    找出真正的表头在第几行（0 基）。
+
+    真实 Excel 极少把表头放在第一行：上面往往压着一行合并的大标题和单位说明，
+    比如「某工厂2024年1-12月销售额  单位：（亿元）」，A1:D1 还是合并单元格。
+    直接 header=0 的后果是：标题被当成第一个列名，后面全变成 Unnamed: 1/2/3，
+    整张表彻底无法分析——而且 pandas 不会报错。
+
+    判定规则：在前 10 行里，挑第一行同时满足
+      ① 非空单元格数 ≥ 最宽行的 60%（排除那种只有一格标题的行）
+      ② 其中至少一半是字符串（表头文字，而不是数据）
+    """
+    head = raw.head(10)
+    widths = head.notna().sum(axis=1)
+    if widths.empty or widths.max() == 0:
+        return 0
+    widest = int(widths.max())
+
+    for i in range(len(head)):
+        row = head.iloc[i].dropna()
+        if len(row) < max(2, widest * 0.6):
+            continue
+        str_ratio = sum(1 for v in row if isinstance(v, str)) / len(row)
+        if str_ratio >= 0.5:
+            return i
+    return 0
+
+
+def _coerce_dtypes(df):
+    """
+    还原被 header=None 打乱的数值类型。
+
+    这是个必须补的坑：用 `read_excel(header=None)` 才能自己找表头，
+    但代价是表头那一行也被当成数据读了进来，于是**整列都变成 object**——
+    "年份 2005"、"净利润 1200" 全成了字符串。
+    后果比想象中严重：数值列会被判成"每行都不一样的字符串"，
+    直接归类到 ID 列，相关性、趋势、异常值三类分析全部归零，而且不报错。
+
+    这里逐列试着转数值，只有"绝大多数单元格都能转"时才替换，
+    避免把"备注"这种真文本列里夹带的数字当成数值。
+    """
+    for c in df.columns:
+        s = df[c]
+        if s.dtype != object:
+            continue
+        conv = pd.to_numeric(s, errors="coerce")
+        non_null = int(s.notna().sum())
+        if non_null and conv.notna().sum() >= non_null * 0.95:
+            df[c] = conv
+    return df
+
+
 def load_table(path):
     """读取 CSV / Excel，并做最基础的清理（列名去空格）。"""
     ext = os.path.splitext(path)[1].lower()
     if ext in (".xlsx", ".xls"):
         try:
-            df = pd.read_excel(path)
+            raw = pd.read_excel(path, header=None)
         except ImportError:
             # 原始报错是 "Missing optional dependency 'openpyxl'"，用户看不懂该干什么。
             # 这里把它翻译成一条可以直接照抄的命令——出错信息的第一职责是给出下一步。
@@ -86,13 +187,23 @@ def load_table(path):
                 f"    python -m pip install openpyxl\n"
                 f"（若是老的 .xls 格式，再补一个：python -m pip install xlrd）\n"
             ) from None
+
+        hdr = _detect_header_row(raw)
+        names = []
+        for i, v in enumerate(raw.iloc[hdr]):
+            text = "" if v is None or (isinstance(v, float) and np.isnan(v)) else str(v)
+            text = text.replace("\u3000", " ").strip()
+            names.append(text or f"列{i + 1}")
+        df = raw.iloc[hdr + 1:].reset_index(drop=True)
+        df.columns = names
+        df = _coerce_dtypes(df)
     else:
         # utf-8-sig 能吃掉 Excel 导出时带的 BOM，不加的话第一列列名会变成 "\ufeff学号"
         df = pd.read_csv(path, encoding="utf-8-sig")
 
     # 真实表格的列名经常带前后空格/全角空格，不去掉会导致后面按列名取不到
     df.columns = [str(c).replace("\u3000", " ").strip() for c in df.columns]
-    # 去掉完全空白的列
+    # 去掉完全空白的列（合并单元格撑出来的空列就靠这一步清掉）
     df = df.dropna(axis=1, how="all")
     return df
 
@@ -111,7 +222,8 @@ def classify_columns(df):
     如果只用 `dtype == object` 判断，会把所有分类列（性别、专业…）全部漏掉，
     导致组间差异和时间趋势两类分析直接空白。所以这里统一用 is_string_dtype。
     """
-    roles = {"id": [], "datetime": [], "numeric": [], "categorical": [], "text": []}
+    roles = {"id": [], "datetime": [], "time": [], "numeric": [],
+             "categorical": [], "text": []}
 
     for col in df.columns:
         s = df[col]
@@ -143,6 +255,12 @@ def classify_columns(df):
         # --- 数值列 ---
         if pd.api.types.is_numeric_dtype(s) and not pd.api.types.is_bool_dtype(s):
             if n_unique <= 1:      # 所有值相同 = 没有分析价值
+                continue
+            # 「年份 / 月份」这类数字时间轴单独归到 time：
+            # 它不该参与"两个指标有没有相关"（和年份相关其实就是趋势），
+            # 但必须是趋势分析的时间基准。
+            if time_axis_unit(col, s):
+                roles["time"].append(col)
                 continue
             roles["numeric"].append(col)
             continue
@@ -196,7 +314,7 @@ def build_profile(df, roles):
 # ============================================================
 # 4. 各类发现
 # ============================================================
-def _make(kind, score, headline, numbers, columns, suggestion):
+def _make(kind, score, headline, numbers, columns, suggestion, axis=None):
     """统一的发现数据结构。numbers 就是后面给 LLM 的"数字白名单"。"""
     return {
         "kind": kind,
@@ -205,7 +323,15 @@ def _make(kind, score, headline, numbers, columns, suggestion):
         "numbers": numbers,
         "columns": columns,
         "suggestion": suggestion,   # 建议画什么图
+        "axis": axis,               # 仅趋势类用：day / year / month
     }
+
+
+def _fmt_axis_end(v, unit):
+    """把时间轴的端点转成人能读的写法（日期 / 年份 / 月份）。"""
+    if unit == "day":
+        return str(pd.Timestamp(v).date())
+    return str(int(round(float(v))))
 
 
 def find_correlations(df, roles):
@@ -314,44 +440,64 @@ def find_trends(df, roles):
     """
     out = []
 
-    for date_col in roles["datetime"]:
-        d = pd.to_datetime(df[date_col], errors="coerce", format="mixed")
+    # 三种时间轴：真日期、年份、月份。横坐标单位跟着轴走，
+    # 这样"每周期变化"才是真的"每年 / 每月 / 每周"变化，而不是一律换算成周。
+    axes = [(c, "day") for c in roles["datetime"]] + \
+           [(c, time_axis_unit(c, df[c])) for c in roles["time"]]
+
+    for axis_col, unit in axes:
+        if unit is None:
+            continue
+        x_raw, t_raw = build_time_axis(df, axis_col, unit)
+        period_label, per_factor = {"day": ("周", 7.0),
+                                    "year": ("年", 1.0),
+                                    "month": ("月", 1.0)}[unit]
+
         for num in roles["numeric"]:
-            sub = pd.DataFrame({"t": d, "v": pd.to_numeric(df[num], errors="coerce")}).dropna()
+            sub = pd.DataFrame({"x": x_raw, "v": pd.to_numeric(df[num], errors="coerce")}).dropna()
             n = len(sub)
             if n < MIN_PAIR_N:
                 continue
 
-            span_days = (sub["t"].max() - sub["t"].min()).days
-            if span_days < 14:
-                continue      # 时间跨度太短，谈不上"趋势"
+            x = sub["x"].to_numpy().astype(float)
+            lo, hi = float(np.min(x)), float(np.max(x))
+            span = hi - lo
+            if span <= 0:
+                continue
+            # 跨度门槛：日期轴至少两周；年/月轴至少 3 个周期
+            if (unit == "day" and span < 14) or (unit != "day" and span < 3):
+                continue
 
-            x = (sub["t"] - sub["t"].min()).dt.days.to_numpy().astype(float)
             y = sub["v"].to_numpy().astype(float)
             res = stats.linregress(x, y)
             sd = float(np.std(y, ddof=1))
             if sd == 0:
                 continue
 
-            total_change = float(res.slope) * float(x.max())   # 全期变化量
+            total_change = float(res.slope) * span          # 全期变化量
             # 效应量：总变化相当于几个标准差。太小的趋势不值得写进报告
             effect = abs(total_change) / sd
             if res.pvalue >= P_THRESHOLD or effect < 0.30:
                 continue
 
-            weekly = float(res.slope) * 7
+            per_change = float(res.slope) * per_factor
+            span_text = f"{int(round(span))} 天" if unit == "day" else f"{int(round(span))} {period_label}"
             out.append(_make(
                 kind="trend",
                 score=min(1.0, effect) * 0.6,
-                headline=(f"「{num}」随时间呈{'上升' if res.slope > 0 else '下降'}趋势："
-                          f"每周约{'+' if weekly > 0 else ''}{weekly:.2f}，"
+                headline=(f"「{num}」随{axis_col}呈{'上升' if res.slope > 0 else '下降'}趋势："
+                          f"每{period_label}约{'+' if per_change > 0 else ''}{per_change:.2f}，"
                           f"全期累计{'+' if total_change > 0 else ''}{total_change:.1f}"),
-                numbers={"每周变化": round(weekly, 3), "全期变化": round(total_change, 2),
+                numbers={"周期": period_label,
+                         "每周期变化": round(per_change, 4),
+                         "全期变化": round(total_change, 2),
                          "p": float(f"{res.pvalue:.2e}"), "n": n,
-                         "跨度天数": int(span_days),
-                         "起止": f"{sub['t'].min().date()} ~ {sub['t'].max().date()}"},
-                columns=[date_col, num],
+                         "跨度": span_text,
+                         "起止": f"{_fmt_axis_end(t_raw.min(), unit)} ~ "
+                                f"{_fmt_axis_end(t_raw.max(), unit)}"},
+                columns=[axis_col, num],
                 suggestion="line",
+                axis=unit,
             ))
     return out
 

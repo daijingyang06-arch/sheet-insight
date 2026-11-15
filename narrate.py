@@ -161,14 +161,16 @@ class TemplateNarrator:
             )
 
         if kind == "trend":
-            date_col, num = d["columns"]
-            weekly, total = n["每周变化"], n["全期变化"]
-            up = weekly > 0
+            axis_col, num = d["columns"]
+            period = n.get("周期", "周")
+            per = n["每周期变化"]
+            total = n["全期变化"]
+            up = per > 0
             return (
-                f"「{num}」随时间呈{'上升' if up else '下降'}趋势："
-                f"平均每周{'增加' if up else '减少'} {_fmt(abs(weekly))}，"
-                f"{n['跨度天数']} 天里累计{'增加' if up else '减少'} {_fmt(abs(total))}。"
-                f"这个变化幅度超过了数据本身的日常波动，"
+                f"「{num}」随{axis_col}呈{'上升' if up else '下降'}趋势："
+                f"平均每{period}{'增加' if up else '减少'} {_fmt(abs(per))}，"
+                f"{n['跨度']}里累计{'增加' if up else '减少'} {_fmt(abs(total))}。"
+                f"这个变化幅度超过了数据本身的波动，"
                 f"因此更可能是真实趋势，而不是随机起伏。"
             )
 
@@ -346,6 +348,8 @@ def _profile_table(profile, roles):
         type_of[col] = "分类"
     for col in roles["datetime"]:
         type_of[col] = "日期"
+    for col in roles.get("time", []):
+        type_of[col] = "时间轴"
     for col in roles["text"]:
         type_of[col] = "文本"
     for col in roles["id"]:
