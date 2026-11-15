@@ -1,0 +1,186 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>表格分析助手 · 上传表格，得到能放进报告的结论</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="/">
+    <span class="brand-dot"></span>表格分析助手
+  </a>
+  <nav class="topnav">
+    <a href="/demo">示例结果</a>
+    <a href="https://github.com/daijingyang06-arch/sheet-insight" target="_blank" rel="noopener">源码</a>
+  </nav>
+</header>
+
+<main class="wrap">
+  <section class="hero">
+    <h1>上传一张表格，<br>拿到一份<span class="mark">能放进报告</span>的分析</h1>
+    <p class="lede">
+      自动找出关联关系、组间差异、时间趋势和异常值，配好图，写成中文。
+      所有数字都由 pandas / scipy 直接算出，语言模型只负责措辞——并且每一个数字都要过校验。
+    </p>
+  </section>
+
+  <section class="panel">
+    <div id="drop" class="drop" tabindex="0" role="button" aria-label="选择或拖入表格文件">
+      <input id="file" type="file" accept=".csv,.xlsx,.xls" hidden>
+      <div class="drop-inner">
+        <div class="drop-icon" aria-hidden="true">
+          <svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M12 16V4m0 0L7 9m5-5 5 5"/><path d="M4 17v2a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1v-2"/>
+          </svg>
+        </div>
+        <p class="drop-title">把表格拖进来，或 <span class="link">点这里选择文件</span></p>
+        <p class="drop-hint">支持 .csv / .xlsx / .xls，单文件不超过 {{ max_mb }} MB</p>
+      </div>
+    </div>
+
+    <div id="status" class="status" hidden>
+      <div class="spinner" aria-hidden="true"></div>
+      <div class="status-text">
+        <p id="status-main" class="status-main">正在上传…</p>
+        <p id="status-sub" class="status-sub">统计计算 + 写结论 + 配图，通常 3～8 秒</p>
+      </div>
+      <span id="timer" class="timer">0.0s</span>
+    </div>
+
+    <div id="error" class="error" hidden>
+      <p id="error-text"></p>
+      <button id="retry" class="ghost-btn" type="button">换一个文件</button>
+    </div>
+
+    <p class="panel-foot">
+      没有现成表格？<a href="/demo">用示例数据试一次 →</a>
+    </p>
+  </section>
+
+  <section class="facts">
+    <div class="fact">
+      <h3>它到底算什么</h3>
+      <p>列类型自动识别、相关性与显著性、分组差异的效应量、时间趋势回归、IQR 异常值。按"值得说的程度"排序，只留 6 条。</p>
+    </div>
+    <div class="fact">
+      <h3>凭什么相信数字</h3>
+      <p>大模型写的每一句话都会被抽出全部数字，逐个和统计结果对账；对不上就重试，再不行退回模板。宁可平淡，不可编造。</p>
+    </div>
+    <div class="fact">
+      <h3>你的表格怎么处理</h3>
+      <p>原始文件只用于本次分析，分析完立刻删除、不落盘。报告与图表保留 {{ ttl_hours }} 小时供你分享，到期自动清除。</p>
+    </div>
+  </section>
+
+  <footer class="foot">
+    <p>描述性分析，说明数据中呈现的关系，<strong>不能证明因果</strong>。</p>
+  </footer>
+</main>
+
+<script>
+(function () {
+  const drop = document.getElementById('drop');
+  const input = document.getElementById('file');
+  const statusBox = document.getElementById('status');
+  const statusMain = document.getElementById('status-main');
+  const statusSub = document.getElementById('status-sub');
+  const timer = document.getElementById('timer');
+  const errorBox = document.getElementById('error');
+  const errorText = document.getElementById('error-text');
+  const retry = document.getElementById('retry');
+
+  const MAX_MB = parseFloat('{{ max_mb }}');
+  const ALLOWED = ['.csv', '.xlsx', '.xls'];
+  let busy = false;
+
+  function showError(msg) {
+    errorBox.hidden = false;
+    errorText.textContent = msg;
+    statusBox.hidden = true;
+    drop.hidden = false;
+  }
+
+  function reset() {
+    busy = false;
+    errorBox.hidden = true;
+    statusBox.hidden = true;
+    drop.hidden = false;
+    input.value = '';
+  }
+
+  function extOf(name) {
+    const i = name.lastIndexOf('.');
+    return i < 0 ? '' : name.slice(i).toLowerCase();
+  }
+
+  async function submit(file) {
+    if (busy) return;
+    const ext = extOf(file.name);
+    if (!ALLOWED.includes(ext)) {
+      showError('只支持 .csv / .xlsx / .xls，这个是「' + (ext || '无扩展名') + '」。');
+      return;
+    }
+    if (file.size > MAX_MB * 1e6) {
+      showError('文件 ' + (file.size / 1e6).toFixed(1) + ' MB，超过上限 ' + MAX_MB + ' MB。可以先删掉无关列再传。');
+      return;
+    }
+
+    busy = true;
+    errorBox.hidden = true;
+    drop.hidden = true;
+    statusBox.hidden = false;
+    statusMain.textContent = '正在上传…';
+
+    const t0 = performance.now();
+    const tick = setInterval(() => {
+      const s = (performance.now() - t0) / 1000;
+      timer.textContent = s.toFixed(1) + 's';
+      if (s > 1.2) statusMain.textContent = '正在计算统计量…';
+      if (s > 3.5) statusMain.textContent = '正在生成结论与配图…';
+    }, 100);
+
+    try {
+      const res = await fetch('/analyze', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/octet-stream',
+          'X-Filename': encodeURIComponent(file.name)
+        },
+        body: file
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.error || ('服务器返回 ' + res.status));
+      clearInterval(tick);
+      statusMain.textContent = '完成，正在打开结果…';
+      window.location.href = data.url;
+    } catch (e) {
+      clearInterval(tick);
+      reset();
+      showError(e.message || '上传失败，请检查网络后重试。');
+    }
+  }
+
+  drop.addEventListener('click', () => !busy && input.click());
+  drop.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); input.click(); }
+  });
+  input.addEventListener('change', () => {
+    if (input.files && input.files[0]) submit(input.files[0]);
+  });
+  ['dragenter', 'dragover'].forEach(ev => drop.addEventListener(ev, (e) => {
+    e.preventDefault(); drop.classList.add('over');
+  }));
+  ['dragleave', 'drop'].forEach(ev => drop.addEventListener(ev, (e) => {
+    e.preventDefault(); drop.classList.remove('over');
+  }));
+  drop.addEventListener('drop', (e) => {
+    const f = e.dataTransfer.files && e.dataTransfer.files[0];
+    if (f) submit(f);
+  });
+  retry.addEventListener('click', reset);
+})();
+</script>
+</body>
+</html>

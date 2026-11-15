@@ -14,6 +14,10 @@ data/*.xlsx
 data/*.xls
 data/upload_*
 
+# 分享结果（含别人的表格内容，绝不入库）
+shared/
+_verify_share/
+
 # 编辑器 / 系统
 .vscode/
 .idea/

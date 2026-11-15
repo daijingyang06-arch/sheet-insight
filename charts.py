@@ -233,20 +233,24 @@ RENDERERS = {
 }
 
 
-def render(discovery, df, index):
+def render(discovery, df, index, chart_dir=None):
     """
     给一条发现画图，返回图片相对路径（供 Markdown 引用）；失败返回 None。
 
     失败不抛异常——一张图画不出来不该让整份报告生不出来。
+
+    chart_dir 可注入：Web 层每次分析要写到自己的任务目录，
+    不能都塞进 results/charts（那样两个用户同时分析会互相覆盖）。
     """
     kind = discovery.get("kind")
     fn = RENDERERS.get(kind)
     if fn is None:
         return None
 
-    os.makedirs(CHART_DIR, exist_ok=True)
+    chart_dir = chart_dir or CHART_DIR
+    os.makedirs(chart_dir, exist_ok=True)
     filename = f"fig{index}_{kind}.png"
-    full = os.path.join(CHART_DIR, filename)
+    full = os.path.join(chart_dir, filename)
 
     fig, ax = plt.subplots(figsize=(6.6, 4.0), dpi=130)
     fig.patch.set_facecolor("white")

@@ -495,11 +495,14 @@ def render_report(source, profile, roles, records, discoveries, issues, backends
 # ============================================================
 # 6. 主流程
 # ============================================================
-def pick_narrator(backend):
+def pick_narrator(backend, quiet=False):
     key = os.environ.get(API_KEY_ENV, "").strip()
 
     if backend == "llm":
         if not key:
+            if quiet:
+                # Web 层不能 sys.exit——那会把整个服务器进程带走
+                raise RuntimeError(f"未设置环境变量 {API_KEY_ENV}，无法使用大模型后端。")
             print(f"未设置环境变量 {API_KEY_ENV}，无法使用大模型后端。")
             print("  设置方法（PowerShell）：$env:SHEET_INSIGHT_API_KEY=\"sk-...\"")
             sys.exit(2)
@@ -508,10 +511,95 @@ def pick_narrator(backend):
     if backend == "auto":
         if key:
             return LLMNarrator(key)
-        print(f"未检测到 {API_KEY_ENV}，本次使用离线模板后端（效果可用，文笔较平）。")
+        if not quiet:
+            print(f"未检测到 {API_KEY_ENV}，本次使用离线模板后端（效果可用，文笔较平）。")
         return TemplateNarrator()
 
     return TemplateNarrator()
+
+
+def run_pipeline(data_path, out_dir=None, backend="auto", quiet=True):
+    """
+    读表 → 找发现 → 写文案 → 配图，返回全部中间产物（不写报告文件）。
+
+    Web 层和命令行共用这一条路径。理由很实际：如果界面里另写一套分析流程，
+    就会出现"命令行结论对、网页上结论不一样"这种最难排查的问题。
+
+    out_dir 只用于决定图表存哪：Web 层每次分析给一个独立目录，
+    否则两个人同时上传会互相覆盖图片。
+    """
+    out_dir = out_dir or OUT_DIR
+    chart_dir = os.path.join(out_dir, "charts")
+
+    df = A.load_table(data_path)
+    if len(df) == 0:
+        raise ValueError("没有读到任何数据行——可能只有表头，或者表头下面全是空行。")
+    roles = A.classify_columns(df)
+    profile = A.build_profile(df, roles)
+
+    all_found = (A.find_correlations(df, roles) + A.find_group_differences(df, roles)
+                 + A.find_trends(df, roles) + A.find_outliers(df, roles))
+    issues = A.find_quality_issues(df, roles)
+    discoveries = A.select_top(all_found, top_k=6)
+
+    if not quiet:
+        if not discoveries:
+            print("没有找到达到统计门槛的发现——仍会生成一份报告，说清楚为什么。")
+
+    narrator = pick_narrator(backend, quiet=quiet)
+    if not quiet:
+        print(f"\n表达层后端：{getattr(narrator, 'label', '模板（离线）')}")
+        print("=" * 62)
+
+    records, backends = [], []
+    for i, d in enumerate(discoveries, 1):
+        rec = narrate_one(d, narrator)
+        chart = charts.render(d, df, i, chart_dir=chart_dir)
+        # numbers / columns 一起塞进记录：Web 结果页要拿它在结论下面列"关键数字"，
+        # 否则只能去 discoveries 里二次查找，两处结构容易不一致。
+        rec.update({"index": i, "kind": d["kind"], "chart": chart,
+                    "headline": d["headline"], "numbers": d["numbers"],
+                    "columns": d["columns"]})
+        records.append(rec)
+        backends.append(rec["backend"])
+
+        if not quiet:
+            flag = "✓" if rec["backend"] != "template" or not rec["fallback_reason"] else "↩"
+            print(f"  [{flag}] {i}. {KIND_CN.get(d['kind'], d['kind']):<5} "
+                  f"{rec['backend']:<8} 尝试 {rec['attempts']} 次"
+                  f"{'  图:' + rec['chart'] if chart else ''}")
+            if rec["fallback_reason"]:
+                print(f"      降级原因：{rec['fallback_reason']}")
+
+    md = render_report(os.path.basename(data_path), profile, roles,
+                       records, discoveries, issues, backends)
+
+    stats = {
+        "total": len(records),
+        "from_llm": backends.count("llm"),
+        "fallback": sum(1 for r in records if r["fallback_reason"]),
+        "retries": sum(1 for r in records if r["attempts"] > 1),
+        # 被守卫拦下的 LLM 违规次数（发生在生成过程中）
+        "llm_rejected": sum(len(v["bad_numbers"])
+                            for r in records for v in r["violations"]),
+        # 最终报告里残留的未授权数字——这个必须恒为 0，是产品的硬指标
+        "final_unauthorized": sum(len(r["final_check"]) for r in records),
+    }
+
+    return {
+        "source": os.path.basename(data_path),
+        "markdown": md,
+        "profile": profile,
+        "roles": roles,
+        "records": records,
+        "discoveries": discoveries,
+        "issues": issues,
+        "stats": stats,
+        "backend": getattr(narrator, "name", "template"),
+        "backend_label": getattr(narrator, "label", "模板（离线）"),
+        "out_dir": out_dir,
+        "generated_at": datetime.now().isoformat(timespec="seconds"),
+    }
 
 
 def main(argv=None):
@@ -525,70 +613,33 @@ def main(argv=None):
         print(f"找不到文件：{args.path}")
         return 1
 
-    # --- 统计层：拿 discoveries ---
-    df = A.load_table(args.path)
-    roles = A.classify_columns(df)
-    profile = A.build_profile(df, roles)
-    all_found = (A.find_correlations(df, roles) + A.find_group_differences(df, roles)
-                 + A.find_trends(df, roles) + A.find_outliers(df, roles))
-    issues = A.find_quality_issues(df, roles)
-    discoveries = A.select_top(all_found, top_k=6)
-
-    if not discoveries:
-        print("没有找到达到统计门槛的发现——仍会生成一份报告，说清楚为什么。")
-
-    # --- 表达层：逐条生成 ---
-    narrator = pick_narrator(args.backend)
-    print(f"\n表达层后端：{getattr(narrator, 'label', '模板（离线）')}")
-    print("=" * 62)
-
-    records, backends = [], []
-    for i, d in enumerate(discoveries, 1):
-        rec = narrate_one(d, narrator)
-        chart = charts.render(d, df, i)
-        rec.update({"index": i, "kind": d["kind"], "chart": chart, "headline": d["headline"]})
-        records.append(rec)
-        backends.append(rec["backend"])
-
-        flag = "✓" if rec["backend"] != "template" or not rec["fallback_reason"] else "↩"
-        print(f"  [{flag}] {i}. {KIND_CN.get(d['kind'], d['kind']):<5} "
-              f"{rec['backend']:<8} 尝试 {rec['attempts']} 次"
-              f"{'  图:' + rec['chart'] if chart else ''}")
-        if rec["fallback_reason"]:
-            print(f"      降级原因：{rec['fallback_reason']}")
+    out_dir = os.path.dirname(os.path.abspath(args.out)) or OUT_DIR
+    try:
+        res = run_pipeline(args.path, out_dir=out_dir, backend=args.backend, quiet=False)
+    except ValueError as e:
+        print(f"无法分析：{e}")
+        return 1
 
     # --- 落盘 ---
-    md = render_report(os.path.basename(args.path), profile, roles,
-                       records, discoveries, issues, backends)
-    os.makedirs(os.path.dirname(args.out), exist_ok=True)
+    os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
     with open(args.out, "w", encoding="utf-8") as f:
-        f.write(md)
+        f.write(res["markdown"])
 
-    guard_stats = {
-        "total": len(records),
-        "from_llm": backends.count("llm"),
-        "fallback": sum(1 for r in records if r["fallback_reason"]),
-        "retries": sum(1 for r in records if r["attempts"] > 1),
-        # 被守卫拦下的 LLM 违规次数（发生在生成过程中）
-        "llm_rejected": sum(len(v["bad_numbers"])
-                            for r in records for v in r["violations"]),
-        # 最终报告里残留的未授权数字——这个必须恒为 0，是产品的硬指标
-        "final_unauthorized": sum(len(r["final_check"]) for r in records),
-    }
-    with open(os.path.join(OUT_DIR, "narration.json"), "w", encoding="utf-8") as f:
-        json.dump({"source": os.path.basename(args.path),
-                   "generated_at": datetime.now().isoformat(timespec="seconds"),
-                   "backend": getattr(narrator, "name", "template"),
-                   "stats": guard_stats,
-                   "records": records}, f, ensure_ascii=False, indent=2)
+    with open(os.path.join(out_dir, "narration.json"), "w", encoding="utf-8") as f:
+        json.dump({"source": res["source"],
+                   "generated_at": res["generated_at"],
+                   "backend": res["backend"],
+                   "stats": res["stats"],
+                   "records": res["records"]}, f, ensure_ascii=False, indent=2)
 
+    stats = res["stats"]
     print("=" * 62)
     print(f"报告已生成：{args.out}")
-    print(f"数字守卫：{guard_stats['total']} 条结论，"
-          f"生成过程中拦截未授权数字 {guard_stats['llm_rejected']} 处，"
-          f"降级 {guard_stats['fallback']} 条，重试 {guard_stats['retries']} 条")
-    print(f"最终报告中残留的未授权数字：{guard_stats['final_unauthorized']} 处"
-          f"{'  ✓' if guard_stats['final_unauthorized'] == 0 else '  ✗ 需要排查'}")
+    print(f"数字守卫：{stats['total']} 条结论，"
+          f"生成过程中拦截未授权数字 {stats['llm_rejected']} 处，"
+          f"降级 {stats['fallback']} 条，重试 {stats['retries']} 条")
+    print(f"最终报告中残留的未授权数字：{stats['final_unauthorized']} 处"
+          f"{'  ✓' if stats['final_unauthorized'] == 0 else '  ✗ 需要排查'}")
     return 0
 
 

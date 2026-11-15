@@ -1,0 +1,150 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{ meta.source }} · 分析结果</title>
+  <meta name="robots" content="noindex">
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="/">
+    <span class="brand-dot"></span>表格分析助手
+  </a>
+  <nav class="topnav">
+    <a href="/">新建分析</a>
+  </nav>
+</header>
+
+<main class="wrap">
+  <section class="result-head">
+    <p class="eyebrow">
+      分析完成{% if meta.elapsed_sec %} · 用时 {{ meta.elapsed_sec }} 秒{% endif %}
+    </p>
+    <h1 class="doc-title">{{ meta.source }}</h1>
+    <div class="chips">
+      <span class="chip">{{ meta.rows }} 行 × {{ meta.cols }} 列</span>
+      <span class="chip">{{ meta.n_findings }} 条发现</span>
+      <span class="chip">{% if meta.backend == 'llm' %}大模型措辞{% else %}模板措辞（离线）{% endif %}</span>
+      <span class="chip quiet">{{ meta.created_at.replace('T', ' ') }}</span>
+    </div>
+
+    <div class="actions">
+      <a class="btn primary" href="/r/{{ meta.id }}/report.md">下载 Markdown 报告</a>
+      <button class="btn" id="copy" type="button" data-url="">复制分享链接</button>
+      <a class="btn ghost" href="/">再分析一份</a>
+    </div>
+
+    <p class="guard {% if meta.stats.final_unauthorized == 0 %}ok{% else %}bad{% endif %}">
+      {% if meta.stats.final_unauthorized == 0 %}
+        数字校验通过：报告中 {{ meta.n_findings }} 条结论的全部数字均来自统计计算，未授权数字 0 处。
+      {% else %}
+        注意：有 {{ meta.stats.final_unauthorized }} 处数字未通过校验，请以下载的报告中的「依据」为准。
+      {% endif %}
+      本链接 {{ meta.remaining_hours }} 小时后自动失效。
+    </p>
+  </section>
+
+  {% if cards %}
+  {% for c in cards %}
+  <article class="card">
+    <div class="card-head">
+      <span class="badge kind-{{ c.kind }}">{{ c.kind_cn }}</span>
+      <span class="card-index">{{ '%02d' % c.index }}</span>
+    </div>
+    <h2 class="card-title">{{ c.headline }}</h2>
+    <p class="card-text">{{ c.text }}</p>
+
+    {% if c.chart %}
+    <figure class="figure">
+      <img src="/r/{{ meta.id }}/charts/{{ c.chart }}" alt="{{ c.headline }}" loading="lazy">
+    </figure>
+    {% endif %}
+
+    {% if c.metrics %}
+    <dl class="metrics">
+      {% for m in c.metrics %}
+      <div class="metric{% if m.wide %} wide{% endif %}">
+        <dt>{{ m.label }}</dt><dd>{{ m.value }}</dd>
+      </div>
+      {% endfor %}
+    </dl>
+    {% endif %}
+  </article>
+  {% endfor %}
+  {% else %}
+  <article class="card empty">
+    <h2 class="card-title">这张表里没有达到统计门槛的发现</h2>
+    <p class="card-text">
+      程序跑完了，只是没有找到足够强的关联、差异或趋势——<strong>这不等于表格有问题</strong>。
+      常见原因有三种：
+    </p>
+    <ol class="reason">
+      <li><strong>行数偏少。</strong>几十行的样本里，要看出稳定的规律本身就很困难。</li>
+      <li><strong>字段之间确实没有明显关系。</strong>这是正常结果，不是分析失败。</li>
+      <li><strong>关键列没被识别为数值。</strong>比如金额带了「万元」、百分比带了「%」、或者数字被存成了文本。</li>
+    </ol>
+    <p class="card-text">下载的报告里仍然有完整的数据概况表，可以先用它核对列类型是否符合预期。</p>
+  </article>
+  {% endif %}
+
+  {% if meta.issues %}
+  <section class="issues">
+    <h2>数据质量提示</h2>
+    <p class="issues-lede">以下字段存在问题，可能影响结论的可靠性：</p>
+    <table>
+      <thead><tr><th>字段</th><th>问题</th><th>严重度</th></tr></thead>
+      <tbody>
+        {% for it in meta.issues %}
+        <tr>
+          <td>{{ it['列'] }}</td>
+          <td>{{ it['问题'] }}</td>
+          <td><span class="sev sev-{{ it['严重度'] }}">{{ it['严重度'] }}</span></td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </section>
+  {% endif %}
+
+  <section class="note">
+    <h2>这份页面是摘要</h2>
+    <p>
+      完整报告（Markdown）还包含 <strong>逐列数据概况表</strong>与<strong>局限说明</strong>，
+      下载后可以直接放进课程报告，或者贴进任意 Markdown 编辑器。
+    </p>
+    <p class="muted">
+      本报告只做描述性分析，说明数据中呈现的关系，<strong>不能证明因果关系</strong>。
+      结果保留 {{ ttl_hours }} 小时后自动删除；原始表格在分析结束时即已删除，从未长期保存。
+    </p>
+  </section>
+
+  <footer class="foot">
+    <a href="/">← 分析另一张表格</a>
+  </footer>
+</main>
+
+<script>
+(function () {
+  const btn = document.getElementById('copy');
+  btn.addEventListener('click', async () => {
+    const url = window.location.href;
+    try {
+      await navigator.clipboard.writeText(url);
+    } catch (e) {
+      const ta = document.createElement('textarea');
+      ta.value = url;
+      document.body.appendChild(ta);
+      ta.select();
+      document.execCommand('copy');
+      ta.remove();
+    }
+    const old = btn.textContent;
+    btn.textContent = '已复制 ✓';
+    setTimeout(() => { btn.textContent = old; }, 1600);
+  });
+})();
+</script>
+</body>
+</html>
