@@ -1,0 +1,10 @@
+# 统计层
+pandas>=2.0
+numpy>=1.24
+scipy>=1.10
+
+# 图表
+matplotlib>=3.7
+
+# 读取 .xlsx（只传 CSV 的话可以不装）
+openpyxl>=3.1
