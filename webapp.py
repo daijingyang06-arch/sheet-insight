@@ -69,6 +69,15 @@ def clean_filename(raw):
     带 ../ 的名字等于把服务器目录结构交出去。
     """
     name = unquote(raw or "").strip()
+    # HTTP 头按规范只能是 latin-1。网页走 encodeURIComponent（上面 unquote 已还原），
+    # 但脚本、App、curl 常把裸 UTF-8 字节直接塞进 header，Starlette 按 latin-1 解出来
+    # 就是 "1 æä½31ä¸ªå°åºæ..." 这种乱码——文件名会一路传到页面标题和下载文件名。
+    # 判据：还原后每个字符都 <= U+00FF（纯 latin-1），说明很可能被错误解码了一层。
+    if name and all(ord(ch) <= 0xFF for ch in name):
+        try:
+            name = name.encode("latin-1").decode("utf-8")
+        except (UnicodeDecodeError, UnicodeEncodeError):
+            pass    # 真就是 latin-1 的名字（如 café.xlsx），保持原样
     name = name.replace("\\", "/").split("/")[-1]
     name = "".join(ch for ch in name if ch.isprintable())
     name = re.sub(r"\s+", " ", name).strip(" .")

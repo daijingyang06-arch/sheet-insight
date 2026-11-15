@@ -312,13 +312,19 @@ a:hover { text-decoration: underline; }
   background: #fff;
 }
 
+/* 用 flex 而不是 grid：指标个数不定（4~6 个），用固定列数的 grid 时
+   最后一行常剩下孤零零的一个，看起来像排版坏了。flex 会让最后一行自己撑满。 */
 .metrics {
-  display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+  display: flex;
+  flex-wrap: wrap;
   gap: 12px 18px;
   margin: 20px 0 0;
   padding-top: 16px;
   border-top: 1px dashed var(--line);
+}
+.metric {
+  flex: 1 1 120px;
+  min-width: 0;
 }
 .metric dt {
   font-size: 12px;
@@ -334,8 +340,8 @@ a:hover { text-decoration: underline; }
   color: var(--text);
   word-break: break-word;
 }
-/* 长值（各组均值那种）横跨两格，否则被挤成两行很难读 */
-.metric.wide { grid-column: span 2; }
+/* 长值（各组均值那种）占两份宽度，否则被挤成两行很难读 */
+.metric.wide { flex: 2 1 260px; }
 
 .reason {
   margin: 4px 0 14px;

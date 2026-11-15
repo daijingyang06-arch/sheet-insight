@@ -185,6 +185,20 @@ def main():
         jid = r.json().get("id") if r.status_code == 200 else ""
         check("返回不可猜的 id", bool(jid) and len(jid) >= 12, jid)
 
+        # 文件名有两条来路：网页走 encodeURIComponent（百分号编码），
+        # 脚本/curl 常发裸 UTF-8（HTTP 头按 latin-1 解 → 乱码）。两条都要对。
+        cn = "我国31个地区GDP.xlsx"
+        check("中文文件名：网页传来能还原", webapp.clean_filename(quote(cn)) == cn,
+              webapp.clean_filename(quote(cn)))
+        raw_utf8_header = cn.encode("utf-8").decode("latin-1")   # 模拟裸 UTF-8 被当 latin-1
+        check("中文文件名：脚本传来也不乱码",
+              webapp.clean_filename(raw_utf8_header) == cn,
+              webapp.clean_filename(raw_utf8_header))
+        check("纯英文名不被误改", webapp.clean_filename("sales_2024.xlsx") == "sales_2024.xlsx")
+        check("带 ../ 的名字只留文件名",
+              webapp.clean_filename("../../etc/passwd.csv") == "passwd.csv",
+              webapp.clean_filename("../../etc/passwd.csv"))
+
         if jid:
             r = client.get(f"/r/{jid}")
             page = r.text
